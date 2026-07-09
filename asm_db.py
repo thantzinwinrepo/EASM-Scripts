@@ -2,34 +2,7 @@
 """
 ASM findings database (SQLite)
 ------------------------------
-A lightweight, single-file database layer for the recon pipeline. It ingests
-the structured JSON your tools already write into a run folder and distills it
-into one queryable `findings` table with proper history tracking.
-
-DESIGN:
-  * The database holds DISTILLED, QUERYABLE findings + history.
-  * The raw scan artifacts stay on disk as evidence — this DB does NOT copy
-    them; each finding stores `run_folder`, a pointer back to the evidence.
-  * Every finding carries: client_id, scan_id, source, and three timestamps —
-    first_seen / last_seen / scan_time — which is what powers delta detection
-    ("what's new since last scan?") and the eventual dashboard.
-
-IDENTITY / DEDUP:
-  A finding is "the same thing seen again" if (client_id, finding_key) matches.
-  On first insert:  first_seen = last_seen = scan_time.
-  On re-observation: last_seen is refreshed, first_seen is preserved.
-  That single rule is what makes history work.
-
-INGESTS (from a run folder):
-  cloud_enrichment.json  -> cloud attribution findings (per IP)
-  takeover_result.json   -> subdomain-takeover hits
-  httpx_result.json      -> live host/service findings (JSONL)
-
-Usage:
-  python3 asm_db.py ingest --latest --client example.com
-  python3 asm_db.py ingest recon_example.com_20260706_142913/
-  python3 asm_db.py stats
-  python3 asm_db.py new --days 7
+A lightweight, single-file database layer for the recon pipeline.
 """
 
 import argparse
@@ -43,13 +16,11 @@ from datetime import datetime, timezone
 RUN_TIMESTAMP_RE = re.compile(r"_(\d{8}_\d{6})$")
 DEFAULT_DB = "asm_findings.db"
 
-
 # ---------------------------------------------------------------------------
 # Time + run-folder helpers
 # ---------------------------------------------------------------------------
 def utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
 
 def find_latest_run(base_dir, domain=None):
     prefix = "recon_"
@@ -70,9 +41,7 @@ def find_latest_run(base_dir, domain=None):
     candidates.sort(key=lambda t: (t[0], t[1]))
     return candidates[-1][2]
 
-
 def parse_run_folder(run_folder):
-    """Return (domain, scan_time_iso) parsed from the run folder name."""
     name = os.path.basename(os.path.normpath(run_folder))
     m = RUN_TIMESTAMP_RE.search(name)
     scan_time = ""
@@ -84,7 +53,6 @@ def parse_run_folder(run_folder):
     domain = name[len("recon_"):] if name.startswith("recon_") else name
     domain = RUN_TIMESTAMP_RE.sub("", domain)
     return domain, (scan_time or utc_now())
-
 
 # ---------------------------------------------------------------------------
 # Schema
@@ -101,7 +69,7 @@ CREATE TABLE IF NOT EXISTS findings (
     port          INTEGER,
     provider      TEXT,                   -- cloud provider, if applicable
     severity      TEXT,                   -- optional risk label
-    vulnerable    INTEGER,                -- 1/0 for takeover verdict; NULL for non-takeover findings
+    vulnerable    INTEGER,                -- 1/0 for takeover verdict
     detail        TEXT,                   -- JSON blob of tool-specific fields
     scan_id       TEXT,                   -- run folder name
     run_folder    TEXT,                   -- path to the raw evidence
@@ -119,7 +87,7 @@ CREATE INDEX IF NOT EXISTS idx_findings_ip       ON findings(ip);
 CREATE INDEX IF NOT EXISTS idx_findings_host     ON findings(hostname);
 
 CREATE TABLE IF NOT EXISTS scans (
-    scan_id     TEXT PRIMARY KEY,         -- run folder name
+    scan_id     TEXT PRIMARY KEY,
     client_id   TEXT NOT NULL,
     domain      TEXT,
     run_folder  TEXT,
@@ -138,7 +106,7 @@ VALUES
    :provider, :severity, :vulnerable, :detail, :scan_id, :run_folder,
    :scan_time, :scan_time, :scan_time, :ingested_at)
 ON CONFLICT(client_id, finding_key) DO UPDATE SET
-   last_seen   = excluded.scan_time,      -- refresh "most recently seen"
+   last_seen   = excluded.scan_time,
    scan_time   = excluded.scan_time,
    scan_id     = excluded.scan_id,
    run_folder  = excluded.run_folder,
@@ -148,16 +116,13 @@ ON CONFLICT(client_id, finding_key) DO UPDATE SET
    vulnerable  = excluded.vulnerable,
    detail      = excluded.detail,
    ingested_at = excluded.ingested_at;
-   -- first_seen intentionally NOT updated -> preserved from first observation
 """
-
 
 def connect(db_path):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     return conn
-
 
 # ---------------------------------------------------------------------------
 # Upsert
@@ -184,16 +149,13 @@ def upsert_finding(conn, *, client_id, finding_key, finding_type, source,
         "ingested_at": utc_now(),
     })
 
-
 def _read_json(path):
     if not (os.path.isfile(path) and os.path.getsize(path) > 0):
         return None
     with open(path, "r", encoding="utf-8", errors="ignore") as f:
         return json.load(f)
 
-
 def _read_jsonl(path):
-    """httpx -json writes one JSON object per line."""
     rows = []
     if not (os.path.isfile(path) and os.path.getsize(path) > 0):
         return rows
@@ -208,7 +170,6 @@ def _read_jsonl(path):
                 continue
     return rows
 
-
 # ---------------------------------------------------------------------------
 # Ingest: one run folder -> findings
 # ---------------------------------------------------------------------------
@@ -219,28 +180,33 @@ def ingest_run(conn, run_folder, client_id=None):
     client_id = client_id or domain
 
     counts = {"cloud": 0, "takeover": 0, "host_service": 0}
+    ip_providers = {} # Dictionary to map IP addresses to their cloud provider
 
     # -- cloud_enrichment.json --
     cloud = _read_json(os.path.join(run_folder, "cloud_enrichment.json"))
     if cloud:
         for h in cloud.get("hosts", []):
             ip = h.get("ip", "")
+            provider = h.get("provider")
+            
             if not ip:
                 continue
+                
+            # Store the provider for this IP to use in host_service later
+            if provider:
+                ip_providers[ip] = provider
+                
             hostnames = h.get("hostnames", []) or []
             upsert_finding(
                 conn, client_id=client_id, finding_key=f"cloud:{ip}",
                 finding_type="cloud", source="cloud_enrich",
                 hostname=hostnames[0] if hostnames else None, ip=ip,
-                provider=h.get("provider"), detail=h,
+                provider=provider, detail=h,
                 scan_id=scan_id, run_folder=run_folder, scan_time=scan_time,
             )
             counts["cloud"] += 1
 
-    # -- takeover_result.json (subjack JSON array) --
-    # subjack lists EVERY host it checked, with a "vulnerable" verdict.
-    # We record all of them (so a checked-and-clean host is evidence too), but
-    # store the true/false verdict and only mark real hits as high severity.
+    # -- takeover_result.json --
     to = _read_json(os.path.join(run_folder, "takeover_result.json"))
     if isinstance(to, list):
         for item in to:
@@ -260,21 +226,37 @@ def ingest_run(conn, run_folder, client_id=None):
                 detail=item, scan_id=scan_id, run_folder=run_folder, scan_time=scan_time,
             )
             if is_vuln:
-                counts["takeover"] += 1          # count only REAL takeovers
+                counts["takeover"] += 1
             else:
                 counts["takeover_checked"] = counts.get("takeover_checked", 0) + 1
 
-    # -- httpx_result.json (JSONL) --
+    # -- httpx_result.json --
     for row in _read_jsonl(os.path.join(run_folder, "httpx_result.json")):
-        host = row.get("host") or row.get("input") or ""
+        raw_input = row.get("input", "")
+        host = row.get("host") or raw_input
+        
+        # Clean the host to ensure a strictly normalized finding_key
+        if "://" in host:
+            host = host.split("://")[-1]
+        if ":" in host and not host.startswith("["):
+            host = host.split(":")[0]
+            
         port = row.get("port")
+        if not port:
+            if raw_input.startswith("https"): port = 443
+            elif raw_input.startswith("http"): port = 80
+            else: port = 0
+
         ip = None
         a = row.get("a")
         if isinstance(a, list) and a:
             ip = a[0]
-        key_input = row.get("input") or f"{host}:{port}"
-        if not key_input:
-            continue
+            
+        # FIX: Map the cloud provider onto the host_service using the IP dictionary
+        mapped_provider = ip_providers.get(ip)
+
+        key_input = f"{host}:{port}"
+        
         detail = {
             "url": row.get("url"),
             "status_code": row.get("status_code") or row.get("status-code"),
@@ -285,12 +267,12 @@ def ingest_run(conn, run_folder, client_id=None):
         upsert_finding(
             conn, client_id=client_id, finding_key=f"host_service:{key_input}",
             finding_type="host_service", source="httpx",
-            hostname=host, ip=ip, port=int(port) if str(port).isdigit() else None,
+            hostname=host, ip=ip, port=int(port) if str(port).isdigit() else port,
+            provider=mapped_provider, # Successfully injects provider
             detail=detail, scan_id=scan_id, run_folder=run_folder, scan_time=scan_time,
         )
         counts["host_service"] += 1
 
-    # -- record the scan itself --
     conn.execute(
         "INSERT INTO scans (scan_id, client_id, domain, run_folder, scan_time, ingested_at) "
         "VALUES (?,?,?,?,?,?) ON CONFLICT(scan_id) DO UPDATE SET "
@@ -299,14 +281,12 @@ def ingest_run(conn, run_folder, client_id=None):
     )
     conn.commit()
 
-    # how many of the just-ingested findings are brand new (first_seen == this scan)?
     new_count = conn.execute(
         "SELECT COUNT(*) FROM findings WHERE scan_id=? AND first_seen=scan_time",
         (scan_id,),
     ).fetchone()[0]
 
     return client_id, scan_time, counts, new_count
-
 
 # ---------------------------------------------------------------------------
 # Queries (CLI)
@@ -324,13 +304,7 @@ def cmd_stats(conn, _args):
     for r in conn.execute("SELECT client_id, COUNT(*) n FROM findings GROUP BY client_id ORDER BY n DESC"):
         print(f"  {r['client_id']:<28} {r['n']}")
 
-
 def cmd_new(conn, args):
-    """Findings first observed within the last N days — the delta view.
-
-    Cleared takeover checks (vulnerable=0) are noise, so they're excluded by
-    default; pass --all to include them.
-    """
     cutoff = args.days
     filt = "" if args.all else "AND NOT (finding_type='takeover' AND vulnerable=0) "
     rows = conn.execute(
@@ -347,9 +321,7 @@ def cmd_new(conn, args):
         vuln = "  <== VULNERABLE" if (r["finding_type"] == "takeover" and r["vulnerable"] == 1) else ""
         print(f"  {r['first_seen']}  {r['finding_type']:<13} {loc}{extra}{prov}{vuln}")
 
-
 def cmd_takeovers(conn, _args):
-    """Only genuine takeover hits — vulnerable=1."""
     rows = conn.execute(
         "SELECT client_id, hostname, provider, first_seen, last_seen "
         "FROM findings WHERE finding_type='takeover' AND vulnerable=1 "
@@ -362,7 +334,6 @@ def cmd_takeovers(conn, _args):
     for r in rows:
         prov = f" [{r['provider']}]" if r["provider"] else ""
         print(f"  {r['client_id']}  {r['hostname']}{prov}  first={r['first_seen']} last={r['last_seen']}")
-
 
 def cmd_ingest(conn, args):
     if args.latest:
@@ -384,7 +355,6 @@ def cmd_ingest(conn, args):
     print(f"    takeover: {counts['takeover']} VULNERABLE, {checked} checked-and-clean")
     print(f"    {new_count} finding(s) are NEW (first seen this scan).")
 
-
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
@@ -405,12 +375,11 @@ def main():
     p_stats.set_defaults(func=cmd_stats)
 
     p_new = sub.add_parser("new", help="Findings first seen recently (delta view)")
-    p_new.add_argument("--days", type=float, default=7, help="Look-back window in days (default: 7)")
-    p_new.add_argument("--all", action="store_true",
-                       help="Include cleared takeover checks (vulnerable=0), normally hidden")
+    p_new.add_argument("--days", type=float, default=7, help="Look-back window in days")
+    p_new.add_argument("--all", action="store_true", help="Include cleared takeover checks")
     p_new.set_defaults(func=cmd_new)
 
-    p_to = sub.add_parser("takeovers", help="Show ONLY confirmed takeover hits (vulnerable=1)")
+    p_to = sub.add_parser("takeovers", help="Show ONLY confirmed takeovers")
     p_to.set_defaults(func=cmd_takeovers)
 
     args = parser.parse_args()
@@ -419,7 +388,6 @@ def main():
         args.func(conn, args)
     finally:
         conn.close()
-
 
 if __name__ == "__main__":
     main()

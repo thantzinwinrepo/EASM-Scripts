@@ -2,7 +2,6 @@ asm_findings.db
 *.db
 recon_*/
 azure_servicetags.json
-azure.json
 aws.json
 gcp.json
 fastly.json

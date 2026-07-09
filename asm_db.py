@@ -26,8 +26,8 @@ INGESTS (from a run folder):
   httpx_result.json      -> live host/service findings (JSONL)
 
 Usage:
-  python3 asm_db.py ingest --latest --client myanmar-brewery.com
-  python3 asm_db.py ingest recon_myanmar-brewery.com_20260706_142913/
+  python3 asm_db.py ingest --latest --client example.com
+  python3 asm_db.py ingest recon_example.com_20260706_142913/
   python3 asm_db.py stats
   python3 asm_db.py new --days 7
 """

@@ -10,7 +10,7 @@ screens it for subdomain-takeover indicators using subjack.
 
 Point it at either:
   * the dnsx result file directly:   -i recon_.../dnsx_result.txt
-  * or the whole run folder:         -i recon_myanmar-brewery.com_20260704_105337/
+  * or the whole run folder:         -i recon_example.com_20260704_105337/
     (it will locate dnsx_result.txt inside and write results back into the
      same folder, keeping each run a self-contained evidence package)
 
